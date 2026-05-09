@@ -1,0 +1,282 @@
+# sellstein-pages-builder workflow source-of-truth.
+#
+# This file's canonical location is:
+#   github.com/sohnceyman2244t66/sellstein-pages-builder/.github/workflows/build-deploy.yml
+#
+# Pushing it to that repo requires a GitHub PAT with the `workflow` scope.
+# The current GITHUB_PAT (gh CLI keyring, set on operator-api) only has
+# `gist`, `read:org`, `repo` — pushes are rejected with:
+#   refusing to allow an OAuth App to create or update workflow … without `workflow` scope
+#
+# To activate the GitHub Actions builder path:
+#   1) `gh auth refresh -h github.com -s workflow`
+#      (interactive — needs browser)
+#   2) Clone github.com/sohnceyman2244t66/sellstein-pages-builder
+#   3) Copy this file to .github/workflows/build-deploy.yml in the clone
+#   4) Commit + push
+#
+# Until then, the API's GitHub-Actions dispatch path returns a clean
+# "no_workflow" error from /pages-deploy-stream and the merchant sees a
+# helpful message in the deploy log instead of a 500.
+#
+# The body below is the same as scripts/write-builder-workflow.cjs would
+# produce — keep them in sync.
+
+name: Build and Deploy
+
+on:
+  repository_dispatch:
+    types: [build-deploy]
+
+concurrency:
+  group: build-${{ github.event.client_payload.deploy_id }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build ${{ github.event.client_payload.framework }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Resolve inputs
+        id: vars
+        env:
+          DEPLOY_ID: ${{ github.event.client_payload.deploy_id }}
+          FRAMEWORK: ${{ github.event.client_payload.framework }}
+          SOURCE_URL: ${{ github.event.client_payload.source_url }}
+          CALLBACK_URL: ${{ github.event.client_payload.callback_url }}
+          CALLBACK_TOKEN: ${{ github.event.client_payload.callback_token }}
+          BUILD_CMD_IN: ${{ github.event.client_payload.build_command }}
+          INSTALL_CMD_IN: ${{ github.event.client_payload.install_command }}
+          OUTPUT_DIR_IN: ${{ github.event.client_payload.output_dir }}
+          NODE_VERSION_IN: ${{ github.event.client_payload.node_version }}
+          RUNTIME_IN: ${{ github.event.client_payload.runtime }}
+        run: |
+          set -e
+          for var in DEPLOY_ID FRAMEWORK SOURCE_URL CALLBACK_URL CALLBACK_TOKEN; do
+            if [ -z "${!var}" ]; then
+              echo "::error::Missing required client_payload field: $var"
+              exit 1
+            fi
+          done
+          case "$CALLBACK_URL" in
+            https://api.sellstein.com/*) ;;
+            https://*.sellstein.com/*)   ;;
+            *)
+              echo "::error::Refusing callback to $CALLBACK_URL"
+              exit 1
+              ;;
+          esac
+          BUILD_CMD="${BUILD_CMD_IN:-npm run build}"
+          INSTALL_CMD="${INSTALL_CMD_IN:-npm install --no-audit --no-fund}"
+          OUTPUT_DIR="${OUTPUT_DIR_IN:-dist}"
+          NODE_VERSION="${NODE_VERSION_IN:-20}"
+          RUNTIME="${RUNTIME_IN:-node}"
+          {
+            echo "deploy_id=$DEPLOY_ID"
+            echo "framework=$FRAMEWORK"
+            echo "source_url=$SOURCE_URL"
+            echo "callback_url=$CALLBACK_URL"
+            echo "build_cmd=$BUILD_CMD"
+            echo "install_cmd=$INSTALL_CMD"
+            echo "output_dir=$OUTPUT_DIR"
+            echo "node_version=$NODE_VERSION"
+            echo "runtime=$RUNTIME"
+          } >> "$GITHUB_OUTPUT"
+          echo "::add-mask::$CALLBACK_TOKEN"
+          echo "callback_token=$CALLBACK_TOKEN" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Node.js
+        if: steps.vars.outputs.runtime == 'node'
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ steps.vars.outputs.node_version }}
+
+      - name: Set up Hugo
+        if: steps.vars.outputs.runtime == 'hugo'
+        uses: peaceiris/actions-hugo@v3
+        with:
+          hugo-version: '0.131.0'
+          extended: true
+
+      - name: Set up Ruby (Jekyll)
+        if: steps.vars.outputs.runtime == 'jekyll'
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.3'
+          bundler-cache: false
+
+      - name: Set up Python (MkDocs / Pelican)
+        if: steps.vars.outputs.runtime == 'python'
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Download source tarball
+        env:
+          SOURCE_URL: ${{ steps.vars.outputs.source_url }}
+        run: |
+          set -e
+          mkdir -p src
+          curl --fail --silent --show-error --location \
+            --connect-timeout 30 --max-time 180 --max-filesize 209715200 \
+            -H "User-Agent: sellstein-pages-builder" \
+            -o src.tar.gz "$SOURCE_URL"
+          if tar -tzf src.tar.gz | grep -E '^(/|.*\.\./)' >/dev/null; then
+            echo "::error::Source archive contains unsafe paths"
+            exit 1
+          fi
+          tar -xzf src.tar.gz -C src
+          rm src.tar.gz
+          echo "Extracted source ($(du -sh src | awk '{print $1}'))"
+
+      - name: Install dependencies
+        working-directory: src
+        env:
+          INSTALL_CMD: ${{ steps.vars.outputs.install_cmd }}
+          FRAMEWORK: ${{ steps.vars.outputs.framework }}
+          RUNTIME: ${{ steps.vars.outputs.runtime }}
+        run: |
+          set -e
+          case "$RUNTIME" in
+            node)
+              echo "::group::install (node)"
+              if [ -f package-lock.json ]; then
+                npm ci --no-audit --no-fund
+              elif [ -f pnpm-lock.yaml ]; then
+                corepack enable
+                pnpm install --no-frozen-lockfile
+              elif [ -f yarn.lock ]; then
+                corepack enable
+                yarn install --no-immutable
+              else
+                eval "$INSTALL_CMD"
+              fi
+              echo "::endgroup::"
+              ;;
+            jekyll)
+              echo "::group::bundle install"
+              if [ ! -f Gemfile ]; then
+                printf 'source "https://rubygems.org"\ngem "jekyll", "~> 4.3"\n' > Gemfile
+              fi
+              bundle config set --local path 'vendor/bundle'
+              bundle install --jobs 4 --retry 3
+              echo "::endgroup::"
+              ;;
+            python)
+              echo "::group::pip install"
+              python -m pip install --upgrade pip
+              if [ -f requirements.txt ]; then
+                pip install -r requirements.txt
+              elif [ -f pyproject.toml ]; then
+                pip install . || true
+              fi
+              case "$FRAMEWORK" in
+                mkdocs) pip show mkdocs >/dev/null 2>&1 || pip install mkdocs mkdocs-material ;;
+                pelican) pip show pelican >/dev/null 2>&1 || pip install "pelican[markdown]" ;;
+              esac
+              echo "::endgroup::"
+              ;;
+            hugo)
+              echo "Hugo binary already on PATH"
+              ;;
+            *)
+              echo "::error::Unsupported runtime: $RUNTIME"
+              exit 1
+              ;;
+          esac
+
+      - name: Build
+        working-directory: src
+        env:
+          BUILD_CMD: ${{ steps.vars.outputs.build_cmd }}
+          NODE_OPTIONS: '--max-old-space-size=4096'
+          NEXT_TELEMETRY_DISABLED: '1'
+          DO_NOT_TRACK: '1'
+          ASTRO_TELEMETRY_DISABLED: '1'
+          GATSBY_TELEMETRY_DISABLED: '1'
+          NUXT_TELEMETRY_DISABLED: '1'
+        run: |
+          set -e
+          echo "::group::build ($BUILD_CMD)"
+          eval "$BUILD_CMD"
+          echo "::endgroup::"
+
+      - name: Verify output dir
+        id: verify
+        working-directory: src
+        env:
+          OUTPUT_DIR: ${{ steps.vars.outputs.output_dir }}
+        run: |
+          set -e
+          if [ ! -d "$OUTPUT_DIR" ]; then
+            echo "::error::Build produced no output at $OUTPUT_DIR"
+            ls -la
+            exit 1
+          fi
+          FILE_COUNT=$(find "$OUTPUT_DIR" -type f | wc -l | tr -d ' ')
+          if [ "$FILE_COUNT" -eq 0 ]; then
+            echo "::error::Output dir is empty"
+            exit 1
+          fi
+          SIZE_BYTES=$(du -sb "$OUTPUT_DIR" | awk '{print $1}')
+          if [ "$SIZE_BYTES" -gt 209715200 ]; then
+            echo "::error::Build output too large: $((SIZE_BYTES / 1024 / 1024)) MB"
+            exit 1
+          fi
+          echo "file_count=$FILE_COUNT" >> "$GITHUB_OUTPUT"
+          echo "size_bytes=$SIZE_BYTES" >> "$GITHUB_OUTPUT"
+
+      - name: Tar build output
+        working-directory: src
+        env:
+          OUTPUT_DIR: ${{ steps.vars.outputs.output_dir }}
+        run: |
+          set -e
+          tar -czf /tmp/build-output.tar.gz -C "$OUTPUT_DIR" .
+          ls -lh /tmp/build-output.tar.gz
+
+      - name: Upload to operator-api
+        env:
+          CALLBACK_URL: ${{ steps.vars.outputs.callback_url }}
+          CALLBACK_TOKEN: ${{ steps.vars.outputs.callback_token }}
+          FILE_COUNT: ${{ steps.verify.outputs.file_count }}
+          SIZE_BYTES: ${{ steps.verify.outputs.size_bytes }}
+        run: |
+          set -e
+          status_code=$(curl --silent --show-error --output /tmp/response.json --write-out '%{http_code}' \
+            --connect-timeout 30 --max-time 600 \
+            -X POST \
+            -H "Authorization: Bearer $CALLBACK_TOKEN" \
+            -H "Content-Type: application/gzip" \
+            -H "X-Build-Status: success" \
+            -H "X-Build-File-Count: $FILE_COUNT" \
+            -H "X-Build-Bytes: $SIZE_BYTES" \
+            --data-binary "@/tmp/build-output.tar.gz" \
+            "$CALLBACK_URL" || true)
+          echo "Callback HTTP $status_code"
+          cat /tmp/response.json 2>/dev/null || true
+          if [ "$status_code" != "200" ] && [ "$status_code" != "202" ]; then
+            echo "::error::Callback returned status $status_code"
+            exit 1
+          fi
+
+      - name: Report failure
+        if: failure()
+        env:
+          CALLBACK_URL: ${{ steps.vars.outputs.callback_url }}
+          CALLBACK_TOKEN: ${{ steps.vars.outputs.callback_token }}
+          DEPLOY_ID: ${{ steps.vars.outputs.deploy_id }}
+        run: |
+          curl --silent --show-error --output /dev/null \
+            --connect-timeout 10 --max-time 30 \
+            -X POST \
+            -H "Authorization: Bearer $CALLBACK_TOKEN" \
+            -H "Content-Type: application/json" \
+            -H "X-Build-Status: failed" \
+            -d "{\"deploy_id\":\"$DEPLOY_ID\",\"error\":\"build-failed\",\"run_url\":\"https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}\"}" \
+            "$CALLBACK_URL?status=failed" || true
