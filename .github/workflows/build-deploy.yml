@@ -66,6 +66,7 @@ jobs:
           case "$CALLBACK_URL" in
             https://api.sellstein.com/*) ;;
             https://*.sellstein.com/*)   ;;
+            https://operator-api.*.workers.dev/*) ;;
             *)
               echo "::error::Refusing callback to $CALLBACK_URL"
               exit 1
