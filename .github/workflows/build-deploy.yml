@@ -1,28 +1,19 @@
-# sellstein-pages-builder workflow source-of-truth.
-#
-# This file's canonical location is:
-#   github.com/sohnceyman2244t66/sellstein-pages-builder/.github/workflows/build-deploy.yml
-#
-# Pushing it to that repo requires a GitHub PAT with the `workflow` scope.
-# The current GITHUB_PAT (gh CLI keyring, set on operator-api) only has
-# `gist`, `read:org`, `repo` — pushes are rejected with:
-#   refusing to allow an OAuth App to create or update workflow … without `workflow` scope
-#
-# To activate the GitHub Actions builder path:
-#   1) `gh auth refresh -h github.com -s workflow`
-#      (interactive — needs browser)
-#   2) Clone github.com/sohnceyman2244t66/sellstein-pages-builder
-#   3) Copy this file to .github/workflows/build-deploy.yml in the clone
-#   4) Commit + push
-#
-# Until then, the API's GitHub-Actions dispatch path returns a clean
-# "no_workflow" error from /pages-deploy-stream and the merchant sees a
-# helpful message in the deploy log instead of a 500.
-#
-# The body below is the same as scripts/write-builder-workflow.cjs would
-# produce — keep them in sync.
-
 name: Build and Deploy
+# Triggered via repository_dispatch from operator-api with event_type
+# build-deploy. Payload (client_payload) carries:
+#
+#   {
+#     "deploy_id":      "...",
+#     "framework":      "nextjs|nuxt|astro|vite-react|...",
+#     "source_url":     "https://api.sellstein.com/internal/build-source/...",
+#     "callback_url":   "https://api.sellstein.com/pages-build-callback/...",
+#     "callback_token": "<base64url(hmac)>.<exp>",
+#     "build_command":  "npm run build",
+#     "install_command":"npm install",
+#     "output_dir":     "dist",
+#     "node_version":   "20",
+#     "runtime":        "node|hugo|jekyll|python"
+#   }
 
 on:
   repository_dispatch:
@@ -118,6 +109,7 @@ jobs:
           python-version: '3.12'
 
       - name: Download source tarball
+        id: source
         env:
           SOURCE_URL: ${{ steps.vars.outputs.source_url }}
         run: |
@@ -127,16 +119,45 @@ jobs:
             --connect-timeout 30 --max-time 180 --max-filesize 209715200 \
             -H "User-Agent: sellstein-pages-builder" \
             -o src.tar.gz "$SOURCE_URL"
-          if tar -tzf src.tar.gz | grep -E '^(/|.*\.\./)' >/dev/null; then
+          if tar -tzf src.tar.gz | grep -E '^(/|.*\.\.\/)' >/dev/null; then
             echo "::error::Source archive contains unsafe paths"
             exit 1
           fi
           tar -xzf src.tar.gz -C src
           rm src.tar.gz
-          echo "Extracted source ($(du -sh src | awk '{print $1}'))"
+          ROOT="src"
+          has_sig() {
+            local d="$1"
+            for f in package.json next.config.js next.config.mjs next.config.ts next.config.cjs \
+                     vite.config.js vite.config.ts vite.config.mjs astro.config.mjs astro.config.ts \
+                     nuxt.config.ts nuxt.config.js svelte.config.js svelte.config.ts gatsby-config.js \
+                     remix.config.js remix.config.ts angular.json index.html index.htm \
+                     hugo.toml hugo.yaml config.toml _config.yml Gemfile mkdocs.yml pelicanconf.py \
+                     requirements.txt pyproject.toml composer.json; do
+              if [ -e "$d/$f" ]; then return 0; fi
+            done
+            return 1
+          }
+          if ! has_sig "$ROOT"; then
+            entries=$(ls -A "$ROOT" 2>/dev/null | grep -v '^\.' || true)
+            count=$(echo "$entries" | grep -c '.' || true)
+            if [ "$count" -eq 1 ]; then
+              only="$(echo "$entries" | head -n1)"
+              if [ -d "$ROOT/$only" ] && has_sig "$ROOT/$only"; then
+                echo "Detected wrapper directory '$only' — shifting working dir."
+                ROOT="$ROOT/$only"
+              fi
+            fi
+          fi
+          if ! has_sig "$ROOT"; then
+            echo "::warning::Could not find project signatures at $ROOT — build may fail. Top-level listing:"
+            ls -la "$ROOT" | head -30
+          fi
+          echo "src_root=$ROOT" >> "$GITHUB_OUTPUT"
+          echo "Extracted source to $ROOT ($(du -sh "$ROOT" | awk '{print $1}'))"
 
       - name: Install dependencies
-        working-directory: src
+        working-directory: ${{ steps.source.outputs.src_root }}
         env:
           INSTALL_CMD: ${{ steps.vars.outputs.install_cmd }}
           FRAMEWORK: ${{ steps.vars.outputs.framework }}
@@ -192,7 +213,7 @@ jobs:
           esac
 
       - name: Build
-        working-directory: src
+        working-directory: ${{ steps.source.outputs.src_root }}
         env:
           BUILD_CMD: ${{ steps.vars.outputs.build_cmd }}
           NODE_OPTIONS: '--max-old-space-size=4096'
@@ -209,7 +230,7 @@ jobs:
 
       - name: Verify output dir
         id: verify
-        working-directory: src
+        working-directory: ${{ steps.source.outputs.src_root }}
         env:
           OUTPUT_DIR: ${{ steps.vars.outputs.output_dir }}
         run: |
@@ -233,7 +254,7 @@ jobs:
           echo "size_bytes=$SIZE_BYTES" >> "$GITHUB_OUTPUT"
 
       - name: Tar build output
-        working-directory: src
+        working-directory: ${{ steps.source.outputs.src_root }}
         env:
           OUTPUT_DIR: ${{ steps.vars.outputs.output_dir }}
         run: |
