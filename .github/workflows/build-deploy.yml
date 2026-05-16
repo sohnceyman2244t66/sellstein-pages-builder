@@ -229,8 +229,56 @@ jobs:
           ASTRO_TELEMETRY_DISABLED: '1'
           GATSBY_TELEMETRY_DISABLED: '1'
           NUXT_TELEMETRY_DISABLED: '1'
+          # ── Build-time placeholders for common SDKs that instantiate clients
+          # at module-load (not lazily inside the handler). Next.js's "Collect
+          # page data" pass imports every route file at build time, so a
+          # top-level `new Resend(process.env.RESEND_API_KEY)` crashes the
+          # build when the env is empty. These placeholders satisfy the
+          # constructor's "key is non-empty" check; real values are set as
+          # Cloudflare Pages runtime env vars and resolved at request time
+          # (server-side keys are NOT inlined into the bundle — only NEXT_PUBLIC_*
+          # vars are, and we deliberately do NOT set those here so the user's
+          # actual NEXT_PUBLIC_* values from their import payload take effect).
+          # If a user explicitly sets one of these via env_vars in the
+          # client_payload, that overrides the placeholder (last-write wins).
+          RESEND_API_KEY: 're_placeholder_buildtime_only_replace_in_cf_pages'
+          SENDGRID_API_KEY: 'SG.placeholder_buildtime_only_replace_in_cf_pages'
+          POSTMARK_SERVER_TOKEN: 'placeholder-buildtime'
+          MAILGUN_API_KEY: 'key-placeholder-buildtime'
+          STRIPE_SECRET_KEY: 'sk_test_placeholder_buildtime'
+          STRIPE_WEBHOOK_SECRET: 'whsec_placeholder_buildtime'
+          OPENAI_API_KEY: 'sk-placeholder-buildtime'
+          ANTHROPIC_API_KEY: 'sk-ant-placeholder-buildtime'
+          DATABASE_URL: 'postgres://placeholder:placeholder@localhost:5432/placeholder'
+          NEXTAUTH_SECRET: 'placeholder-nextauth-secret-replace-in-prod'
+          NEXTAUTH_URL: 'https://placeholder.local'
+          AUTH_SECRET: 'placeholder-auth-secret-replace-in-prod'
+          CLERK_SECRET_KEY: 'sk_test_placeholder_buildtime'
+          SUPABASE_SERVICE_ROLE_KEY: 'placeholder-buildtime'
+          TWILIO_AUTH_TOKEN: 'placeholder-buildtime'
+          # User-supplied env_vars from the import payload (JSON object). When
+          # present, exported one-per-line BEFORE running the build so the
+          # user's real values override the placeholders above for THEIR
+          # build only.
+          USER_ENV_JSON: ${{ toJson(github.event.client_payload.env_vars) }}
         run: |
           set -e
+          # Export user-supplied env_vars (if any). Keys must match
+          # /^[A-Z_][A-Z0-9_]*$/ to avoid shell injection via key names.
+          if [ -n "$USER_ENV_JSON" ] && [ "$USER_ENV_JSON" != "null" ]; then
+            echo "::group::user env vars"
+            # Parse JSON object → KEY=VALUE pairs, filter keys to safe pattern,
+            # export each line. jq escapes the value safely.
+            echo "$USER_ENV_JSON" | jq -r 'to_entries[] | select(.key | test("^[A-Z_][A-Z0-9_]*$")) | "\(.key)=\(.value)"' | while IFS='=' read -r k v; do
+              echo "  export $k=<redacted>"
+              export "$k=$v"
+            done
+            # Re-export in this shell so the build sees them (subshell scope
+            # loss workaround: write to GITHUB_ENV which both this step and
+            # `eval $BUILD_CMD` below will pick up via the runner env).
+            echo "$USER_ENV_JSON" | jq -r 'to_entries[] | select(.key | test("^[A-Z_][A-Z0-9_]*$")) | "\(.key)=\(.value)"' >> "$GITHUB_ENV"
+            echo "::endgroup::"
+          fi
           echo "::group::build ($BUILD_CMD)"
           eval "$BUILD_CMD"
           echo "::endgroup::"
