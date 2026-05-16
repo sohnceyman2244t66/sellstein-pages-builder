@@ -219,6 +219,38 @@ jobs:
               ;;
           esac
 
+      - name: Patch Next.js API routes for Edge Runtime
+        if: steps.vars.outputs.framework == 'nextjs' || steps.vars.outputs.framework == 'next'
+        working-directory: ${{ steps.source.outputs.src_root }}
+        run: |
+          set -e
+          # Cloudflare Pages Functions only run on the Edge Runtime. Every
+          # Next.js API route that uses Node-only globals must opt in via
+          # `export const runtime = 'edge'`. Auto-inject when missing so
+          # v0/AI-generated projects deploy without manual edits. Most
+          # popular SDKs (Stripe, Resend, OpenAI, Anthropic, Supabase
+          # client) already publish edge-compatible builds.
+          shopt -s nullglob globstar
+          count=0
+          patched=0
+          for f in app/api/**/route.ts app/api/**/route.tsx app/api/**/route.js app/api/**/route.jsx                    src/app/api/**/route.ts src/app/api/**/route.tsx src/app/api/**/route.js src/app/api/**/route.jsx                    pages/api/**/*.ts pages/api/**/*.tsx pages/api/**/*.js pages/api/**/*.jsx                    src/pages/api/**/*.ts src/pages/api/**/*.tsx src/pages/api/**/*.js src/pages/api/**/*.jsx; do
+            [ -e "$f" ] || continue
+            count=$((count + 1))
+            # Already declares runtime? skip.
+            if grep -qE "export[[:space:]]+const[[:space:]]+runtime[[:space:]]*=" "$f"; then
+              echo "  skip (already has runtime): $f"
+              continue
+            fi
+            # Prepend the directive. Use a temp file so the original
+            # file's encoding is preserved.
+            printf "export const runtime = 'edge';
+%s" "$(cat "$f")" > "$f.tmp"
+            mv "$f.tmp" "$f"
+            patched=$((patched + 1))
+            echo "  patched: $f"
+          done
+          echo "Edge runtime: patched $patched/$count Next.js API route files"
+
       - name: Build
         working-directory: ${{ steps.source.outputs.src_root }}
         env:
