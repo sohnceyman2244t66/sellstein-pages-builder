@@ -241,11 +241,14 @@ jobs:
               echo "  skip (already has runtime): $f"
               continue
             fi
-            # Prepend the directive. Use a temp file so the original
-            # file's encoding is preserved.
-            printf "export const runtime = 'edge';
-%s" "$(cat "$f")" > "$f.tmp"
-            mv "$f.tmp" "$f"
+            # Prepend the directive. Use a here-doc + cat so we never put
+            # a literal newline inside YAML's block scalar (printf with 
+
+            # breaks the YAML parser when the workflow file is loaded).
+            {
+              echo "export const runtime = 'edge';"
+              cat "$f"
+            } > "$f.tmp" && mv "$f.tmp" "$f"
             patched=$((patched + 1))
             echo "  patched: $f"
           done
