@@ -304,6 +304,22 @@ jobs:
           # API routes, and rewrites — same way npx next-on-pages does it
           # locally when you "Deploy to CF Pages" from the Vercel CLI.
           if [ -d .next ]; then
+            # next-on-pages invokes `vercel build` which STRIPS the parent
+            # shell's env vars (Vercel-style: env must come from Vercel's
+            # env service OR a .env file). Write the same placeholders to
+            # .env.local so the inner `next build` sees them. Existing
+            # .env.local entries win (user might have set real values).
+            echo "::group::seed .env.local for vercel build"
+            touch .env.local
+            for kv in               "RESEND_API_KEY=re_placeholder_buildtime"               "SENDGRID_API_KEY=SG.placeholder_buildtime"               "POSTMARK_SERVER_TOKEN=placeholder-buildtime"               "MAILGUN_API_KEY=key-placeholder-buildtime"               "STRIPE_SECRET_KEY=sk_test_placeholder_buildtime"               "STRIPE_PUBLISHABLE_KEY=pk_test_placeholder_buildtime"               "STRIPE_WEBHOOK_SECRET=whsec_placeholder_buildtime"               "NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY=pk_test_placeholder_buildtime"               "OPENAI_API_KEY=sk-placeholder-buildtime"               "ANTHROPIC_API_KEY=sk-ant-placeholder-buildtime"               "DATABASE_URL=postgres://placeholder:placeholder@localhost:5432/placeholder"               "NEXTAUTH_SECRET=placeholder-nextauth-secret"               "NEXTAUTH_URL=https://placeholder.local"               "AUTH_SECRET=placeholder-auth-secret"               "CLERK_SECRET_KEY=sk_test_placeholder_buildtime"               "NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY=pk_test_placeholder_buildtime"               "SUPABASE_SERVICE_ROLE_KEY=placeholder-buildtime"               "NEXT_PUBLIC_SUPABASE_URL=https://placeholder.supabase.co"               "NEXT_PUBLIC_SUPABASE_ANON_KEY=placeholder-anon-key"               "TWILIO_AUTH_TOKEN=placeholder-buildtime"; do
+              key="${kv%%=*}"
+              # Only append if .env.local doesn't already have this key
+              if ! grep -q "^${key}=" .env.local 2>/dev/null; then
+                echo "$kv" >> .env.local
+              fi
+            done
+            echo "  .env.local now has $(wc -l < .env.local) lines"
+            echo "::endgroup::"
             echo "::group::next-on-pages adapter"
             # Install the adapter inline. Pin to v1 — v2 requires Node 22.
             npx --yes @cloudflare/next-on-pages@1
