@@ -321,8 +321,22 @@ jobs:
             echo "  .env.local now has $(wc -l < .env.local) lines"
             echo "::endgroup::"
             echo "::group::next-on-pages adapter"
-            # Install the adapter inline. Pin to v1 — v2 requires Node 22.
-            npx --yes @cloudflare/next-on-pages@1
+            # Pick the package-manager runner that matches the lockfile.
+            # next-on-pages internally re-runs the project's build via
+            # `vercel build`, which auto-detects the package manager from
+            # the lockfile — but it also validates node_modules with the
+            # SAME PM that invoked it. Calling it via `npx` when the
+            # project is pnpm yields `npm ELSPROBLEMS` on pnpm-style
+            # node_modules. Match the runner to the lockfile.
+            if [ -f pnpm-lock.yaml ]; then
+              corepack prepare pnpm@9.15.9 --activate
+              pnpm dlx @cloudflare/next-on-pages@1
+            elif [ -f yarn.lock ]; then
+              corepack prepare yarn@1.22.22 --activate
+              yarn dlx @cloudflare/next-on-pages@1
+            else
+              npx --yes @cloudflare/next-on-pages@1
+            fi
             echo "::endgroup::"
             # The adapter writes to .vercel/output/static — promote it to the
             # output_dir the rest of the workflow expects.
