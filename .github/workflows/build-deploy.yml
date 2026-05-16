@@ -283,6 +283,46 @@ jobs:
           eval "$BUILD_CMD"
           echo "::endgroup::"
 
+      - name: Cloudflare Pages adapter (Next.js SSR/SSG → static)
+        if: steps.vars.outputs.framework == 'nextjs' || steps.vars.outputs.framework == 'next'
+        working-directory: ${{ steps.source.outputs.src_root }}
+        env:
+          OUTPUT_DIR: ${{ steps.vars.outputs.output_dir }}
+        run: |
+          set -e
+          # If next build produced a static `out/` (i.e. project has
+          # `output: 'export'` in next.config), nothing to do — that's
+          # already CF-Pages-shaped.
+          if [ -d out ] && [ "$(find out -type f | head -1)" ]; then
+            echo "Static export detected at out/ — no adapter needed."
+            exit 0
+          fi
+          # If `.next` exists but `out/` doesn't, the project is SSR/SSG.
+          # Run the official Cloudflare adapter to compile `.next` →
+          # `.vercel/output/static` which Cloudflare Pages can serve.
+          # @cloudflare/next-on-pages handles edge-runtime routes, ISR,
+          # API routes, and rewrites — same way npx next-on-pages does it
+          # locally when you "Deploy to CF Pages" from the Vercel CLI.
+          if [ -d .next ]; then
+            echo "::group::next-on-pages adapter"
+            # Install the adapter inline. Pin to v1 — v2 requires Node 22.
+            npx --yes @cloudflare/next-on-pages@1
+            echo "::endgroup::"
+            # The adapter writes to .vercel/output/static — promote it to the
+            # output_dir the rest of the workflow expects.
+            if [ -d .vercel/output/static ]; then
+              echo "Adapter wrote .vercel/output/static → moving to $OUTPUT_DIR/"
+              # Wipe any pre-existing out/ (would be empty after this build
+              # since the export step didn't run), then move adapter output.
+              rm -rf "$OUTPUT_DIR"
+              mv .vercel/output/static "$OUTPUT_DIR"
+            else
+              echo "::error::next-on-pages did not produce .vercel/output/static"
+              ls -la .vercel/output 2>/dev/null || ls -la .vercel 2>/dev/null || echo "(no .vercel dir)"
+              exit 1
+            fi
+          fi
+
       - name: Verify output dir
         id: verify
         working-directory: ${{ steps.source.outputs.src_root }}
