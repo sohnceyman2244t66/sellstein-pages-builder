@@ -171,9 +171,16 @@ jobs:
                 npm ci --no-audit --no-fund
               elif [ -f pnpm-lock.yaml ]; then
                 corepack enable
+                # Pin pnpm to v9 (latest line that supports Node 20).
+                # Without this, corepack auto-downloads pnpm 11+ which
+                # requires Node v22.13+ for node:sqlite -- boom on Node 20.
+                corepack prepare pnpm@9.15.9 --activate
                 pnpm install --no-frozen-lockfile
               elif [ -f yarn.lock ]; then
                 corepack enable
+                # Pin yarn to classic v1 (what 95%+ of user projects with
+                # yarn.lock actually use). Avoids Berry's strict-mode bites.
+                corepack prepare yarn@1.22.22 --activate
                 yarn install --no-immutable
               else
                 eval "$INSTALL_CMD"
