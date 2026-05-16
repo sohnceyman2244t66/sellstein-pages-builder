@@ -241,16 +241,35 @@ jobs:
               echo "  skip (already has runtime): $f"
               continue
             fi
-            # Prepend the directive. Use a here-doc + cat so we never put
-            # a literal newline inside YAML's block scalar (printf with 
-
-            # breaks the YAML parser when the workflow file is loaded).
+            # Detect Node-only imports that can't bundle for Edge Runtime.
+            # Stripe SDK, Resend, raw `node:` builtins, the `fs` shim, etc.
+            # all fail webpack at build time when forced to edge. Stub these
+            # out with a 501 so the rest of the deploy still succeeds.
+            if grep -qE "from[[:space:]]+['\"](stripe|resend|sendgrid|@aws-sdk|nodemailer|mongoose|pg|mysql2|redis|ioredis|node:|fs[/'\"]|path[/'\"]|crypto[/'\"]|child_process|http[/'\"]|https[/'\"]|net[/'\"]|os[/'\"]|stream[/'\"])" "$f" 2>/dev/null                || grep -qE "require[[:space:]]*\(['\"](stripe|resend|sendgrid|fs|path|node:)" "$f" 2>/dev/null; then
+              {
+                echo "// Auto-stubbed by sellstein-pages-builder: this route imports a"
+                echo "// Node.js-only SDK that cannot run on the Cloudflare Pages Edge"
+                echo "// runtime. The page is deployed; this endpoint returns 501 until"
+                echo "// the implementation is refactored to use an edge-compatible SDK"
+                echo "// build (e.g. stripe/web, resend/edge) OR moved to a Worker."
+                echo "export const runtime = 'edge';"
+                echo "export async function GET()  { return new Response(JSON.stringify({ error: 'API route not deployed (Node-only dependencies)' }), { status: 501, headers: { 'Content-Type': 'application/json' } }); }"
+                echo "export async function POST() { return new Response(JSON.stringify({ error: 'API route not deployed (Node-only dependencies)' }), { status: 501, headers: { 'Content-Type': 'application/json' } }); }"
+                echo "export async function PUT()  { return new Response(JSON.stringify({ error: 'API route not deployed (Node-only dependencies)' }), { status: 501, headers: { 'Content-Type': 'application/json' } }); }"
+                echo "export async function DELETE(){ return new Response(JSON.stringify({ error: 'API route not deployed (Node-only dependencies)' }), { status: 501, headers: { 'Content-Type': 'application/json' } }); }"
+                echo "export async function PATCH(){ return new Response(JSON.stringify({ error: 'API route not deployed (Node-only dependencies)' }), { status: 501, headers: { 'Content-Type': 'application/json' } }); }"
+              } > "$f"
+              patched=$((patched + 1))
+              echo "  stubbed (Node-only deps): $f"
+              continue
+            fi
+            # Edge-compatible route: just inject the runtime directive.
             {
               echo "export const runtime = 'edge';"
               cat "$f"
             } > "$f.tmp" && mv "$f.tmp" "$f"
             patched=$((patched + 1))
-            echo "  patched: $f"
+            echo "  patched (edge runtime): $f"
           done
           echo "Edge runtime: patched $patched/$count Next.js API route files"
 
