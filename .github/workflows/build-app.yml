@@ -1,0 +1,486 @@
+name: Build Native App
+# Triggered via repository_dispatch (event_type build-app) from operator-api.
+# client_payload = AppBuildPayload (apps/api/src/lib/app-build-dispatch.ts):
+#   build_id, platform(android|ios), build_type(debug|release|testflight),
+#   app_name, app_id, version_name, version_code, target_url, icon_url,
+#   callback_url, callback_token, signing_url, signing_token
+#
+# Embed tech: Capacitor 6 in remote-url mode — the native shell loads the
+# already-deployed site (target_url) in a WebView. No web assets are bundled
+# beyond a tiny offline splash fallback.
+#
+# Artifact contract (apps/api/src/routes/app-build-callback.ts):
+#   POST callback_url  Bearer callback_token  x-artifact-kind: apk|aab|ipa  (binary)
+#   fail callback_url?status=failed  Bearer callback_token  X-Build-Status: failed  JSON {error}
+#   GET  signing_url   Bearer signing_token  -> signing material JSON
+
+on:
+  repository_dispatch:
+    types: [build-app]
+
+concurrency:
+  group: app-build-${{ github.event.client_payload.build_id }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  # ────────────────────────────────────────────────────────────────────
+  # ANDROID — ubuntu runner ships the Android SDK; debug needs no signing.
+  # ────────────────────────────────────────────────────────────────────
+  android:
+    if: github.event.client_payload.platform == 'android'
+    name: Android ${{ github.event.client_payload.build_type }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Validate + resolve inputs
+        id: vars
+        env:
+          BUILD_ID: ${{ github.event.client_payload.build_id }}
+          BUILD_TYPE: ${{ github.event.client_payload.build_type }}
+          APP_NAME: ${{ github.event.client_payload.app_name }}
+          APP_ID: ${{ github.event.client_payload.app_id }}
+          VERSION_NAME: ${{ github.event.client_payload.version_name }}
+          VERSION_CODE: ${{ github.event.client_payload.version_code }}
+          TARGET_URL: ${{ github.event.client_payload.target_url }}
+          ICON_URL: ${{ github.event.client_payload.icon_url }}
+          CALLBACK_URL: ${{ github.event.client_payload.callback_url }}
+          CALLBACK_TOKEN: ${{ github.event.client_payload.callback_token }}
+          SIGNING_URL: ${{ github.event.client_payload.signing_url }}
+          SIGNING_TOKEN: ${{ github.event.client_payload.signing_token }}
+        run: |
+          set -e
+          for var in BUILD_ID BUILD_TYPE APP_NAME APP_ID VERSION_NAME VERSION_CODE TARGET_URL CALLBACK_URL CALLBACK_TOKEN; do
+            if [ -z "${!var}" ]; then echo "::error::Missing client_payload field: $var"; exit 1; fi
+          done
+          # Reverse-domain package id (matches PKG_RE on the server).
+          if ! echo "$APP_ID" | grep -qE '^[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*)+$'; then
+            echo "::error::Invalid android package id: $APP_ID"; exit 1
+          fi
+          # Callback must hit our own infra only.
+          case "$CALLBACK_URL" in
+            https://api.sellstein.com/*|https://*.sellstein.com/*|https://operator-api.*.workers.dev/*) ;;
+            *) echo "::error::Refusing callback to $CALLBACK_URL"; exit 1 ;;
+          esac
+          if [ -n "$SIGNING_URL" ]; then
+            case "$SIGNING_URL" in
+              https://api.sellstein.com/*|https://*.sellstein.com/*|https://operator-api.*.workers.dev/*) ;;
+              *) echo "::error::Refusing signing fetch from $SIGNING_URL"; exit 1 ;;
+            esac
+          fi
+          if [ "$BUILD_TYPE" = "release" ] && [ -z "$SIGNING_TOKEN" ]; then
+            echo "::error::release build requires signing material"; exit 1
+          fi
+          # Strip XML/JSON-breaking chars from the display name.
+          SAFE_NAME=$(printf '%s' "$APP_NAME" | tr -d '<>&"'"'" | cut -c1-50)
+          echo "::add-mask::$CALLBACK_TOKEN"
+          [ -n "$SIGNING_TOKEN" ] && echo "::add-mask::$SIGNING_TOKEN"
+          {
+            echo "build_id=$BUILD_ID"
+            echo "build_type=$BUILD_TYPE"
+            echo "app_id=$APP_ID"
+            echo "version_name=$VERSION_NAME"
+            echo "version_code=$VERSION_CODE"
+            echo "target_url=$TARGET_URL"
+            echo "icon_url=$ICON_URL"
+            echo "callback_url=$CALLBACK_URL"
+            echo "signing_url=$SIGNING_URL"
+            echo "safe_name=$SAFE_NAME"
+          } >> "$GITHUB_OUTPUT"
+          { echo "callback_token=$CALLBACK_TOKEN"; echo "signing_token=$SIGNING_TOKEN"; } >> "$GITHUB_OUTPUT"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+
+      - name: Scaffold Capacitor project
+        env:
+          APP_ID: ${{ steps.vars.outputs.app_id }}
+          SAFE_NAME: ${{ steps.vars.outputs.safe_name }}
+          TARGET_URL: ${{ steps.vars.outputs.target_url }}
+        run: |
+          set -e
+          cat > package.json <<'PKGEOF'
+          {
+            "name": "sellstein-native-shell",
+            "version": "1.0.0",
+            "private": true,
+            "dependencies": {
+              "@capacitor/core": "^6.1.2",
+              "@capacitor/cli": "^6.1.2",
+              "@capacitor/android": "^6.1.2"
+            },
+            "devDependencies": {
+              "@capacitor/assets": "^3.0.5"
+            }
+          }
+          PKGEOF
+          # capacitor.config.json — jq builds it so the app name is JSON-safe.
+          jq -n --arg appId "$APP_ID" --arg appName "$SAFE_NAME" --arg url "$TARGET_URL" \
+            '{appId:$appId, appName:$appName, webDir:"www",
+              server:{url:$url, cleartext:false, androidScheme:"https"},
+              android:{allowMixedContent:false}}' > capacitor.config.json
+          cat capacitor.config.json
+          # Tiny offline splash (shown only when target_url is unreachable).
+          mkdir -p www
+          cat > www/index.html <<'HTMLEOF'
+          <!DOCTYPE html><html lang="en"><head><meta charset="utf-8">
+          <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+          <title>Loading</title></head>
+          <body style="margin:0;height:100vh;display:flex;align-items:center;justify-content:center;background:#0a0a0a;color:#fff;font-family:system-ui,-apple-system,sans-serif">
+          <div style="text-align:center"><div style="width:32px;height:32px;border:3px solid #333;border-top-color:#fff;border-radius:50%;margin:0 auto 16px;animation:s 0.8s linear infinite"></div><div style="opacity:.6;font-size:14px">Connecting…</div></div>
+          <style>@keyframes s{to{transform:rotate(360deg)}}</style></body></html>
+          HTMLEOF
+
+      - name: Install Capacitor
+        run: npm install --no-audit --no-fund
+
+      - name: Add Android platform
+        run: npx cap add android
+
+      - name: App icon
+        if: steps.vars.outputs.icon_url != ''
+        env:
+          ICON_URL: ${{ steps.vars.outputs.icon_url }}
+        run: |
+          set +e
+          mkdir -p assets
+          curl --fail --silent --show-error --location --connect-timeout 20 --max-time 60 \
+            --max-filesize 10485760 -H "User-Agent: sellstein-app-builder" \
+            -o assets/icon-src "$ICON_URL"
+          if [ ! -s assets/icon-src ]; then echo "icon download failed — using default"; exit 0; fi
+          if command -v convert >/dev/null 2>&1; then
+            convert assets/icon-src -resize 1024x1024^ -gravity center -extent 1024x1024 assets/icon.png
+          elif command -v magick >/dev/null 2>&1; then
+            magick assets/icon-src -resize 1024x1024^ -gravity center -extent 1024x1024 assets/icon.png
+          else
+            cp assets/icon-src assets/icon.png
+          fi
+          npx @capacitor/assets generate --android || echo "asset generation skipped"
+          exit 0
+
+      - name: Set version
+        env:
+          VERSION_NAME: ${{ steps.vars.outputs.version_name }}
+          VERSION_CODE: ${{ steps.vars.outputs.version_code }}
+        run: |
+          set -e
+          GRADLE=android/app/build.gradle
+          sed -i -E "s/versionCode [0-9]+/versionCode $VERSION_CODE/" "$GRADLE"
+          sed -i -E "s/versionName \"[^\"]*\"/versionName \"$VERSION_NAME\"/" "$GRADLE"
+          grep -E "versionCode|versionName" "$GRADLE"
+
+      - name: Fetch signing material (release)
+        if: steps.vars.outputs.build_type == 'release'
+        id: signing
+        env:
+          SIGNING_URL: ${{ steps.vars.outputs.signing_url }}
+          SIGNING_TOKEN: ${{ steps.vars.outputs.signing_token }}
+        run: |
+          set -e
+          curl --fail --silent --show-error --connect-timeout 20 --max-time 60 \
+            -H "Authorization: Bearer $SIGNING_TOKEN" -o /tmp/signing.json "$SIGNING_URL"
+          KS_B64=$(jq -r '.keystore_base64' /tmp/signing.json)
+          KS_PW=$(jq -r '.keystore_password' /tmp/signing.json)
+          KEY_ALIAS=$(jq -r '.key_alias' /tmp/signing.json)
+          KEY_PW=$(jq -r '.key_password' /tmp/signing.json)
+          rm -f /tmp/signing.json
+          if [ -z "$KS_B64" ] || [ "$KS_B64" = "null" ]; then echo "::error::No keystore in signing material"; exit 1; fi
+          echo "$KS_B64" | base64 -d > "$RUNNER_TEMP/release.keystore"
+          echo "::add-mask::$KS_PW"; echo "::add-mask::$KEY_PW"; echo "::add-mask::$KEY_ALIAS"
+          { echo "ks_pw=$KS_PW"; echo "key_alias=$KEY_ALIAS"; echo "key_pw=$KEY_PW"; } >> "$GITHUB_OUTPUT"
+
+      - name: Build debug APK
+        if: steps.vars.outputs.build_type == 'debug'
+        run: |
+          set -e
+          cd android
+          chmod +x gradlew
+          ./gradlew assembleDebug --no-daemon --stacktrace
+
+      - name: Build release AAB (signed)
+        if: steps.vars.outputs.build_type == 'release'
+        env:
+          KS_PW: ${{ steps.signing.outputs.ks_pw }}
+          KEY_ALIAS: ${{ steps.signing.outputs.key_alias }}
+          KEY_PW: ${{ steps.signing.outputs.key_pw }}
+        run: |
+          set -e
+          cd android
+          chmod +x gradlew
+          ./gradlew bundleRelease --no-daemon --stacktrace \
+            -Pandroid.injected.signing.store.file="$RUNNER_TEMP/release.keystore" \
+            -Pandroid.injected.signing.store.password="$KS_PW" \
+            -Pandroid.injected.signing.key.alias="$KEY_ALIAS" \
+            -Pandroid.injected.signing.key.password="$KEY_PW"
+
+      - name: Locate artifact
+        id: artifact
+        run: |
+          set -e
+          if [ "${{ steps.vars.outputs.build_type }}" = "debug" ]; then
+            FILE=$(find android/app/build/outputs/apk/debug -name '*.apk' | head -1)
+            KIND=apk
+          else
+            FILE=$(find android/app/build/outputs/bundle/release -name '*.aab' | head -1)
+            KIND=aab
+          fi
+          if [ -z "$FILE" ] || [ ! -s "$FILE" ]; then echo "::error::No artifact produced"; find android/app/build/outputs -type f 2>/dev/null | head; exit 1; fi
+          echo "Artifact: $FILE ($(du -h "$FILE" | awk '{print $1}'))"
+          echo "path=$FILE" >> "$GITHUB_OUTPUT"
+          echo "kind=$KIND" >> "$GITHUB_OUTPUT"
+
+      - name: Upload artifact to operator-api
+        env:
+          CALLBACK_URL: ${{ steps.vars.outputs.callback_url }}
+          CALLBACK_TOKEN: ${{ steps.vars.outputs.callback_token }}
+          ART: ${{ steps.artifact.outputs.path }}
+          KIND: ${{ steps.artifact.outputs.kind }}
+        run: |
+          set -e
+          code=$(curl --silent --show-error --output /tmp/resp.json --write-out '%{http_code}' \
+            --connect-timeout 30 --max-time 600 -X POST \
+            -H "Authorization: Bearer $CALLBACK_TOKEN" \
+            -H "Content-Type: application/octet-stream" \
+            -H "x-artifact-kind: $KIND" \
+            -H "x-gh-run-url: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            --data-binary "@$ART" "$CALLBACK_URL" || true)
+          echo "Callback HTTP $code"; cat /tmp/resp.json 2>/dev/null || true
+          [ "$code" = "200" ] || { echo "::error::callback returned $code"; exit 1; }
+
+      - name: Report failure
+        if: failure()
+        env:
+          CALLBACK_URL: ${{ steps.vars.outputs.callback_url }}
+          CALLBACK_TOKEN: ${{ steps.vars.outputs.callback_token }}
+        run: |
+          [ -z "$CALLBACK_TOKEN" ] && exit 0
+          curl --silent --output /dev/null --connect-timeout 10 --max-time 30 -X POST \
+            -H "Authorization: Bearer $CALLBACK_TOKEN" -H "Content-Type: application/json" \
+            -H "X-Build-Status: failed" \
+            -H "x-gh-run-url: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            -d "{\"error\":\"android build failed — see run https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}\"}" \
+            "$CALLBACK_URL?status=failed" || true
+
+  # ────────────────────────────────────────────────────────────────────
+  # iOS — macOS runner. Requires Apple Developer signing (ASC API key).
+  # Written to the modern xcodebuild + ASC-key managed-signing path; not
+  # E2E-verifiable without a live Apple Developer account.
+  # ────────────────────────────────────────────────────────────────────
+  ios:
+    if: github.event.client_payload.platform == 'ios'
+    name: iOS ${{ github.event.client_payload.build_type }}
+    runs-on: macos-14
+    timeout-minutes: 40
+    steps:
+      - name: Validate + resolve inputs
+        id: vars
+        env:
+          BUILD_ID: ${{ github.event.client_payload.build_id }}
+          BUILD_TYPE: ${{ github.event.client_payload.build_type }}
+          APP_NAME: ${{ github.event.client_payload.app_name }}
+          APP_ID: ${{ github.event.client_payload.app_id }}
+          VERSION_NAME: ${{ github.event.client_payload.version_name }}
+          VERSION_CODE: ${{ github.event.client_payload.version_code }}
+          TARGET_URL: ${{ github.event.client_payload.target_url }}
+          ICON_URL: ${{ github.event.client_payload.icon_url }}
+          CALLBACK_URL: ${{ github.event.client_payload.callback_url }}
+          CALLBACK_TOKEN: ${{ github.event.client_payload.callback_token }}
+          SIGNING_URL: ${{ github.event.client_payload.signing_url }}
+          SIGNING_TOKEN: ${{ github.event.client_payload.signing_token }}
+        run: |
+          set -e
+          for var in BUILD_ID BUILD_TYPE APP_NAME APP_ID VERSION_NAME VERSION_CODE TARGET_URL CALLBACK_URL CALLBACK_TOKEN SIGNING_TOKEN SIGNING_URL; do
+            if [ -z "${!var}" ]; then echo "::error::Missing client_payload field: $var"; exit 1; fi
+          done
+          if ! echo "$APP_ID" | grep -qE '^[A-Za-z0-9][A-Za-z0-9-]*(\.[A-Za-z0-9][A-Za-z0-9-]*)+$'; then
+            echo "::error::Invalid ios bundle id: $APP_ID"; exit 1
+          fi
+          case "$CALLBACK_URL" in
+            https://api.sellstein.com/*|https://*.sellstein.com/*|https://operator-api.*.workers.dev/*) ;;
+            *) echo "::error::Refusing callback to $CALLBACK_URL"; exit 1 ;;
+          esac
+          case "$SIGNING_URL" in
+            https://api.sellstein.com/*|https://*.sellstein.com/*|https://operator-api.*.workers.dev/*) ;;
+            *) echo "::error::Refusing signing fetch from $SIGNING_URL"; exit 1 ;;
+          esac
+          SAFE_NAME=$(printf '%s' "$APP_NAME" | tr -d '<>&"'"'" | cut -c1-50)
+          echo "::add-mask::$CALLBACK_TOKEN"; echo "::add-mask::$SIGNING_TOKEN"
+          {
+            echo "build_id=$BUILD_ID"; echo "build_type=$BUILD_TYPE"; echo "app_id=$APP_ID"
+            echo "version_name=$VERSION_NAME"; echo "version_code=$VERSION_CODE"
+            echo "target_url=$TARGET_URL"; echo "icon_url=$ICON_URL"
+            echo "callback_url=$CALLBACK_URL"; echo "signing_url=$SIGNING_URL"; echo "safe_name=$SAFE_NAME"
+          } >> "$GITHUB_OUTPUT"
+          { echo "callback_token=$CALLBACK_TOKEN"; echo "signing_token=$SIGNING_TOKEN"; } >> "$GITHUB_OUTPUT"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Scaffold Capacitor project
+        env:
+          APP_ID: ${{ steps.vars.outputs.app_id }}
+          SAFE_NAME: ${{ steps.vars.outputs.safe_name }}
+          TARGET_URL: ${{ steps.vars.outputs.target_url }}
+        run: |
+          set -e
+          cat > package.json <<'PKGEOF'
+          {
+            "name": "sellstein-native-shell",
+            "version": "1.0.0",
+            "private": true,
+            "dependencies": {
+              "@capacitor/core": "^6.1.2",
+              "@capacitor/cli": "^6.1.2",
+              "@capacitor/ios": "^6.1.2"
+            },
+            "devDependencies": {
+              "@capacitor/assets": "^3.0.5"
+            }
+          }
+          PKGEOF
+          jq -n --arg appId "$APP_ID" --arg appName "$SAFE_NAME" --arg url "$TARGET_URL" \
+            '{appId:$appId, appName:$appName, webDir:"www",
+              server:{url:$url, iosScheme:"https"}}' > capacitor.config.json
+          cat capacitor.config.json
+          mkdir -p www
+          cat > www/index.html <<'HTMLEOF'
+          <!DOCTYPE html><html lang="en"><head><meta charset="utf-8">
+          <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+          <title>Loading</title></head>
+          <body style="margin:0;height:100vh;display:flex;align-items:center;justify-content:center;background:#0a0a0a;color:#fff;font-family:-apple-system,system-ui,sans-serif">
+          <div style="text-align:center"><div style="width:32px;height:32px;border:3px solid #333;border-top-color:#fff;border-radius:50%;margin:0 auto 16px;animation:s 0.8s linear infinite"></div><div style="opacity:.6;font-size:14px">Connecting…</div></div>
+          <style>@keyframes s{to{transform:rotate(360deg)}}</style></body></html>
+          HTMLEOF
+
+      - name: Install Capacitor
+        run: npm install --no-audit --no-fund
+
+      - name: Add iOS platform
+        run: npx cap add ios
+
+      - name: App icon
+        if: steps.vars.outputs.icon_url != ''
+        env:
+          ICON_URL: ${{ steps.vars.outputs.icon_url }}
+        run: |
+          set +e
+          mkdir -p assets
+          curl --fail --silent --show-error --location --connect-timeout 20 --max-time 60 \
+            --max-filesize 10485760 -H "User-Agent: sellstein-app-builder" \
+            -o assets/icon-src "$ICON_URL"
+          if [ ! -s assets/icon-src ]; then echo "icon download failed — using default"; exit 0; fi
+          sips -s format png -z 1024 1024 assets/icon-src --out assets/icon.png || cp assets/icon-src assets/icon.png
+          npx @capacitor/assets generate --ios || echo "asset generation skipped"
+          exit 0
+
+      - name: Fetch signing material
+        id: signing
+        env:
+          SIGNING_URL: ${{ steps.vars.outputs.signing_url }}
+          SIGNING_TOKEN: ${{ steps.vars.outputs.signing_token }}
+        run: |
+          set -e
+          curl --fail --silent --show-error --connect-timeout 20 --max-time 60 \
+            -H "Authorization: Bearer $SIGNING_TOKEN" -o /tmp/signing.json "$SIGNING_URL"
+          TEAM_ID=$(jq -r '.team_id' /tmp/signing.json)
+          KEY_ID=$(jq -r '.asc_key_id' /tmp/signing.json)
+          ISSUER_ID=$(jq -r '.asc_issuer_id' /tmp/signing.json)
+          P8=$(jq -r '.asc_p8' /tmp/signing.json)
+          rm -f /tmp/signing.json
+          if [ -z "$TEAM_ID" ] || [ "$TEAM_ID" = "null" ] || [ -z "$P8" ] || [ "$P8" = "null" ]; then
+            echo "::error::Incomplete iOS signing material (need team_id + asc_p8)"; exit 1
+          fi
+          mkdir -p "$HOME/.appstoreconnect/private_keys"
+          printf '%s' "$P8" > "$HOME/.appstoreconnect/private_keys/AuthKey_${KEY_ID}.p8"
+          echo "::add-mask::$TEAM_ID"; echo "::add-mask::$KEY_ID"; echo "::add-mask::$ISSUER_ID"
+          { echo "team_id=$TEAM_ID"; echo "key_id=$KEY_ID"; echo "issuer_id=$ISSUER_ID"; } >> "$GITHUB_OUTPUT"
+
+      - name: Archive + export IPA (managed signing via ASC key)
+        id: build
+        env:
+          APP_ID: ${{ steps.vars.outputs.app_id }}
+          VERSION_NAME: ${{ steps.vars.outputs.version_name }}
+          VERSION_CODE: ${{ steps.vars.outputs.version_code }}
+          TEAM_ID: ${{ steps.signing.outputs.team_id }}
+          KEY_ID: ${{ steps.signing.outputs.key_id }}
+          ISSUER_ID: ${{ steps.signing.outputs.issuer_id }}
+        run: |
+          set -e
+          cd ios/App
+          cat > exportOptions.plist <<EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0"><dict>
+            <key>method</key><string>app-store-connect</string>
+            <key>teamID</key><string>${TEAM_ID}</string>
+            <key>signingStyle</key><string>automatic</string>
+            <key>destination</key><string>export</string>
+          </dict></plist>
+          EOF
+          xcodebuild -workspace App.xcworkspace -scheme App \
+            -configuration Release -archivePath "$RUNNER_TEMP/App.xcarchive" \
+            -allowProvisioningUpdates \
+            -authenticationKeyPath "$HOME/.appstoreconnect/private_keys/AuthKey_${KEY_ID}.p8" \
+            -authenticationKeyID "$KEY_ID" -authenticationKeyIssuerID "$ISSUER_ID" \
+            DEVELOPMENT_TEAM="$TEAM_ID" PRODUCT_BUNDLE_IDENTIFIER="$APP_ID" \
+            MARKETING_VERSION="$VERSION_NAME" CURRENT_PROJECT_VERSION="$VERSION_CODE" \
+            clean archive
+          xcodebuild -exportArchive -archivePath "$RUNNER_TEMP/App.xcarchive" \
+            -exportPath "$RUNNER_TEMP/export" -exportOptionsPlist exportOptions.plist \
+            -allowProvisioningUpdates \
+            -authenticationKeyPath "$HOME/.appstoreconnect/private_keys/AuthKey_${KEY_ID}.p8" \
+            -authenticationKeyID "$KEY_ID" -authenticationKeyIssuerID "$ISSUER_ID"
+          IPA=$(find "$RUNNER_TEMP/export" -name '*.ipa' | head -1)
+          if [ -z "$IPA" ] || [ ! -s "$IPA" ]; then echo "::error::No IPA produced"; exit 1; fi
+          echo "ipa=$IPA" >> "$GITHUB_OUTPUT"
+
+      - name: Upload to TestFlight
+        if: steps.vars.outputs.build_type == 'testflight'
+        env:
+          KEY_ID: ${{ steps.signing.outputs.key_id }}
+          ISSUER_ID: ${{ steps.signing.outputs.issuer_id }}
+          IPA: ${{ steps.build.outputs.ipa }}
+        run: |
+          set -e
+          xcrun altool --upload-app -f "$IPA" --type ios \
+            --apiKey "$KEY_ID" --apiIssuer "$ISSUER_ID"
+
+      - name: Upload IPA to operator-api
+        env:
+          CALLBACK_URL: ${{ steps.vars.outputs.callback_url }}
+          CALLBACK_TOKEN: ${{ steps.vars.outputs.callback_token }}
+          IPA: ${{ steps.build.outputs.ipa }}
+        run: |
+          set -e
+          code=$(curl --silent --show-error --output /tmp/resp.json --write-out '%{http_code}' \
+            --connect-timeout 30 --max-time 600 -X POST \
+            -H "Authorization: Bearer $CALLBACK_TOKEN" \
+            -H "Content-Type: application/octet-stream" \
+            -H "x-artifact-kind: ipa" \
+            -H "x-gh-run-url: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            --data-binary "@$IPA" "$CALLBACK_URL" || true)
+          echo "Callback HTTP $code"; cat /tmp/resp.json 2>/dev/null || true
+          [ "$code" = "200" ] || { echo "::error::callback returned $code"; exit 1; }
+
+      - name: Report failure
+        if: failure()
+        env:
+          CALLBACK_URL: ${{ steps.vars.outputs.callback_url }}
+          CALLBACK_TOKEN: ${{ steps.vars.outputs.callback_token }}
+        run: |
+          [ -z "$CALLBACK_TOKEN" ] && exit 0
+          curl --silent --output /dev/null --connect-timeout 10 --max-time 30 -X POST \
+            -H "Authorization: Bearer $CALLBACK_TOKEN" -H "Content-Type: application/json" \
+            -H "X-Build-Status: failed" \
+            -H "x-gh-run-url: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            -d "{\"error\":\"ios build failed — see run https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}\"}" \
+            "$CALLBACK_URL?status=failed" || true
