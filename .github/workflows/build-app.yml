@@ -40,16 +40,16 @@ jobs:
         env:
           BUILD_ID: ${{ github.event.client_payload.build_id }}
           BUILD_TYPE: ${{ github.event.client_payload.build_type }}
-          APP_NAME: ${{ github.event.client_payload.app_name }}
-          APP_ID: ${{ github.event.client_payload.app_id }}
-          VERSION_NAME: ${{ github.event.client_payload.version_name }}
-          VERSION_CODE: ${{ github.event.client_payload.version_code }}
+          APP_NAME: ${{ github.event.client_payload.app.name }}
+          APP_ID: ${{ github.event.client_payload.app.id }}
+          VERSION_NAME: ${{ github.event.client_payload.app.version_name }}
+          VERSION_CODE: ${{ github.event.client_payload.app.version_code }}
           TARGET_URL: ${{ github.event.client_payload.target_url }}
           ICON_URL: ${{ github.event.client_payload.icon_url }}
-          CALLBACK_URL: ${{ github.event.client_payload.callback_url }}
-          CALLBACK_TOKEN: ${{ github.event.client_payload.callback_token }}
-          SIGNING_URL: ${{ github.event.client_payload.signing_url }}
-          SIGNING_TOKEN: ${{ github.event.client_payload.signing_token }}
+          CALLBACK_URL: ${{ github.event.client_payload.cb.callback_url }}
+          CALLBACK_TOKEN: ${{ github.event.client_payload.cb.callback_token }}
+          SIGNING_URL: ${{ github.event.client_payload.cb.signing_url }}
+          SIGNING_TOKEN: ${{ github.event.client_payload.cb.signing_token }}
         run: |
           set -e
           for var in BUILD_ID BUILD_TYPE APP_NAME APP_ID VERSION_NAME VERSION_CODE TARGET_URL CALLBACK_URL CALLBACK_TOKEN; do
@@ -285,16 +285,16 @@ jobs:
         env:
           BUILD_ID: ${{ github.event.client_payload.build_id }}
           BUILD_TYPE: ${{ github.event.client_payload.build_type }}
-          APP_NAME: ${{ github.event.client_payload.app_name }}
-          APP_ID: ${{ github.event.client_payload.app_id }}
-          VERSION_NAME: ${{ github.event.client_payload.version_name }}
-          VERSION_CODE: ${{ github.event.client_payload.version_code }}
+          APP_NAME: ${{ github.event.client_payload.app.name }}
+          APP_ID: ${{ github.event.client_payload.app.id }}
+          VERSION_NAME: ${{ github.event.client_payload.app.version_name }}
+          VERSION_CODE: ${{ github.event.client_payload.app.version_code }}
           TARGET_URL: ${{ github.event.client_payload.target_url }}
           ICON_URL: ${{ github.event.client_payload.icon_url }}
-          CALLBACK_URL: ${{ github.event.client_payload.callback_url }}
-          CALLBACK_TOKEN: ${{ github.event.client_payload.callback_token }}
-          SIGNING_URL: ${{ github.event.client_payload.signing_url }}
-          SIGNING_TOKEN: ${{ github.event.client_payload.signing_token }}
+          CALLBACK_URL: ${{ github.event.client_payload.cb.callback_url }}
+          CALLBACK_TOKEN: ${{ github.event.client_payload.cb.callback_token }}
+          SIGNING_URL: ${{ github.event.client_payload.cb.signing_url }}
+          SIGNING_TOKEN: ${{ github.event.client_payload.cb.signing_token }}
         run: |
           set -e
           for var in BUILD_ID BUILD_TYPE APP_NAME APP_ID VERSION_NAME VERSION_CODE TARGET_URL CALLBACK_URL CALLBACK_TOKEN SIGNING_TOKEN SIGNING_URL; do
